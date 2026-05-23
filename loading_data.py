@@ -1,50 +1,28 @@
 import os
-import pandas as pd
-import numpy as np
 import torch
+import numpy as np
+import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 
-def load_unified_labels(data_dir, split='train'):
-    """
-    Reads the three separate diagnosis CSVs and merges them into a single DataFrame.
-    Splits are typically 'train' or 'valid'.
-    """
-    # MRNet CSVs do not have headers; they use format: exam_id, label
-    categories = ['abnormality', 'acl', 'meniscus']
-    dfs = []
-    
-    for cat in categories:
-        csv_path = os.path.join(data_dir, f'{split}-{cat}.csv')
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError(f"Expected CSV file not found at: {csv_path}")
-            
-        df = pd.read_csv(csv_path, header=None, names=['exam_id', cat], dtype={'exam_id': str})
-        dfs.append(df)
-    
-    # Merge all three dataframes on the unique patient exam_id
-    unified_df = dfs[0]
-    for df in dfs[1:]:
-        unified_df = pd.merge(unified_df, df, on='exam_id')
-        
-    # Set exam_id as index for rapid O(1) lookups during batch generation
-    unified_df.set_index('exam_id', inplace=True)
-    return unified_df
-
-
 class MRNetDataset(Dataset):
-    def __init__(self, data_dir, label_df, plane='sagittal', transform=None):
+    def __init__(self, data_dir, labels_csv_path, split='train', view='sagittal'):
         """
         Args:
-            data_dir (str): Path to the extracted MRNet dataset folder.
-            label_df (DataFrame): The unified labels indexed by 4-digit exam_id string.
-            plane (str): One of 'sagittal', 'coronal', or 'axial'.
-            transform (callable, optional): Transformations applied per slice.
+            data_dir (str): Root path to the extracted mrnet_images folder.
+            labels_csv_path (str): Path to our verified unified_labels.csv.
+            split (str): 'train' or 'valid'.
+            view (str): 'sagittal', 'coronal', or 'axial'.
         """
+        # 1. Load the single source of truth we generated
+        self.labels_df = pd.read_csv(labels_csv_path, index_col='exam_id', dtype={'exam_id': str})
+        
+        # 2. Filter by the requested split
+        self.labels_df = self.labels_df[self.labels_df['split'] == split]
+        
         self.data_dir = data_dir
-        self.label_df = label_df
-        self.plane = plane.lower()
-        self.exam_ids = label_df.index.tolist()
-        self.transform = transform
+        self.split = split
+        self.view = view.lower()
+        self.exam_ids = self.labels_df.index.tolist()
 
     def __len__(self):
         return len(self.exam_ids)
@@ -52,35 +30,56 @@ class MRNetDataset(Dataset):
     def __getitem__(self, idx):
         exam_id = self.exam_ids[idx]
         
-        # Construct absolute path to the .npy volume file
-        # Example target: data_dir/train/sagittal/0000.npy
-        split_folder = 'train' if exam_id in self.label_df.index else 'valid' # Handled based on context or setup
-        # For simplicity, we assume label_df corresponds entirely to the correct split folder
+        # 3. Dynamic Pathing (handles both train and valid folder structures)
+        if self.split == 'train':
+            file_path = os.path.join(self.data_dir, self.view, f"{exam_id}.npy")
+        else:
+            file_path = os.path.join(self.data_dir, 'valid_files', self.view, f"{exam_id}.npy")
+            
+        # 4. Load raw volume
+        volume = np.load(file_path)
         
-        # Let's dynamically locate the split path based on parent function context
-        # A clean layout option is grouping by data_dir/split/plane/ID.npy
-        # We will refine the pathing once your exact local folder hierarchy is confirmed
-        return exam_id
+        # 5. Tensor Conversion & Normalization
+        # Convert uint8 [0, 255] to PyTorch float32 [0.0, 1.0]
+        tensor_volume = torch.tensor(volume, dtype=torch.float32) / 255.0
+        
+        # 6. Pseudo-RGB Channel Stacking
+        # Raw shape is (Slices, Height, Width). Pre-trained models need 3 color channels.
+        # unsqueeze(1) creates (Slices, 1, Height, Width)
+        # expand duplicates the grayscale channel 3 times -> (Slices, 3, Height, Width)
+        tensor_volume = tensor_volume.unsqueeze(1).expand(-1, 3, -1, -1)
+        
+        # 7. Fetch the Multi-Task Labels [Abnormal, ACL, Meniscus]
+        row = self.labels_df.loc[exam_id]
+        labels = torch.tensor([row['abnormal'], row['acl'], row['meniscus']], dtype=torch.float32)
+        
+        return tensor_volume, labels
+
+def get_data_loaders(data_dir, labels_csv_path, view='sagittal', batch_size=1, num_workers=0):
+    """
+    Factory function to generate both train and validation DataLoaders.
+    Keeps the Colab notebook clean.
+    """
+    train_dataset = MRNetDataset(data_dir, labels_csv_path, split='train', view=view)
+    valid_dataset = MRNetDataset(data_dir, labels_csv_path, split='valid', view=view)
     
-## This code is meant to be run in a local environment where the MRNet dataset is available.
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    
+    return train_loader, valid_loader
+## run the test 
 if __name__ == '__main__':
-    print("--- Running Local Data Pipeline Verification ---")
+    print("--- Testing PyTorch Data Pipeline ---")
+    # Change this path to where your mrnet_images folder actually lives locally
+    LOCAL_ROOT = "./mrnet_images" 
+    LABEL_PATH = "./unified_labels.csv"
     
-    # CHANGE THIS to your actual local data directory path for testing
-    LOCAL_DATA_DIR = "./mini_data_patch" 
+    # Instantiate the factory
+    train_loader, valid_loader = get_data_loaders(LOCAL_ROOT, LABEL_PATH, view='sagittal', batch_size=1)
     
-    try:
-        # Test Step 1: Label Parsing
-        print("Testing label parser...")
-        labels = load_unified_labels(LOCAL_DATA_DIR, split='train')
-        print(f"Successfully loaded labels. Shape: {labels.shape}")
-        print("Sample data mapping:")
-        print(labels.head(3))
-        
-        # Test Step 2: Dataset Instantiation
-        print("\nTesting Dataset Initialization...")
-        dataset = MRNetDataset(data_dir=LOCAL_DATA_DIR, label_df=labels, plane='sagittal')
-        print(f"Dataset wrapper initialized with {len(dataset)} local samples.")
-        
-    except Exception as e:
-        print(f"\n[ERROR] Pipeline test failed: {str(e)}")
+    # Fetch exactly one batch (one patient)
+    sample_volume, sample_labels = next(iter(train_loader))
+    
+    print(f"Success! Model Input Volume Shape: {sample_volume.shape}")
+    print(f"Success! Model Target Labels Shape: {sample_labels.shape}")
+    print(f"Target Label Values (Abnormal, ACL, Meniscus): {sample_labels}")
