@@ -6,3 +6,4 @@ __pycache__/
 mrnet_images/
 *.csv
 !unified_labels.csv
+*.pth
